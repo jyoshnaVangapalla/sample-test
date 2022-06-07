@@ -1,0 +1,88 @@
+pipeline {
+  agent {
+     kubernetes {
+      defaultContainer 'ssbeauty-amazon-jdk'
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    name: ssbeauty-amazon-jdk
+spec:
+  serviceAccountName: jenkins
+  volumes:
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+  containers:
+  - name: ssbeauty-amazon-jdk
+    image: ${SLAVE_CONTAINER_IMAGE}
+    imagePullPolicy: Always
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: "2Gi"
+    volumeMounts:
+     - name: docker-sock
+       mountPath: /var/run/docker.sock
+"""
+    }
+}
+
+triggers {
+  pollSCM('H/2 * * * *')
+}
+
+options {
+  buildDiscarder(logRotator(numToKeepStr: '10'))
+  skipStagesAfterUnstable()
+  durabilityHint('PERFORMANCE_OPTIMIZED')
+  disableConcurrentBuilds()
+  skipDefaultCheckout(true)
+  overrideIndexTriggers(false)
+}
+
+stages {
+  stage ('Checkout Code'){
+    steps {
+      checkout scm
+      script {
+        env.commit_id = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+        sh(script: "aws ecr get-login --no-include-email --registry-ids ${AWS_ACCOUNT_ID} --region ${AWS_REGION} | sh", returnStdout: true).trim()
+      }
+    }
+  }
+
+  stage('Build Docker') {
+    steps {
+      script {
+          docker.build('dev/ssl-beauty-web', '--network host --pull .')
+          docker.withRegistry('https://644496061305.dkr.ecr.ap-south-1.amazonaws.com') {
+            docker.image('dev/ssl-beauty-web').push(commit_id)
+        }
+      }
+    }
+  }
+
+  stage('Deploy Web') {
+    when {
+      beforeAgent true
+      branch "main"
+    }
+    steps {
+      sh 'aws eks --region ${AWS_REGION} update-kubeconfig --name ${DEV_EKS_NAME}'
+      sh '''
+        helm upgrade --force --install ssl-beauty-web \
+        --set-string image.tag=${commit_id} \
+        --namespace dev --create-namespace \
+        --timeout 600s \
+        --wait \
+        ./charts/web  || exit 1
+      '''
+    }
+  }
+
+}
+}
